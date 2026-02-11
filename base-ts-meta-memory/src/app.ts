@@ -9,24 +9,13 @@ import {
 import { MemoryDB as Database } from "@builderbot/bot";
 import { MetaProvider as Provider } from "@builderbot/provider-meta";
 import cron from "node-cron";
+import { ejecutarTriggerDiario } from "./triggers/dailyMatchTrigger";
+import {
+  ejecutarCheckConfirmaciones,
+  procesarRespuestaJugador,
+} from "./triggers/confirmationTimeoutTrigger";
 
 const PORT = process.env.PORT ?? 3008;
-
-const discordFlow = addKeyword<Provider, Database>("doc").addAnswer(
-  [
-    "You can see the documentation here",
-    "📄 https://builderbot.app/docs \n",
-    "Do you want to continue? *yes*",
-  ].join("\n"),
-  { capture: true },
-  async (ctx, { gotoFlow, flowDynamic }) => {
-    if (ctx.body.toLocaleLowerCase().includes("yes")) {
-      return gotoFlow(registerFlow);
-    }
-    await flowDynamic("Thanks!");
-    return;
-  },
-);
 
 const welcomeFlow = addKeyword<Provider, Database>([
   "hi",
@@ -61,50 +50,27 @@ const welcomeFlow = addKeyword<Provider, Database>([
   },
 );
 
-const registerFlow = addKeyword<Provider, Database>(
-  utils.setEvent("REGISTER_FLOW"),
-)
-  .addAnswer(
-    `What is your name?`,
-    { capture: true },
-    async (ctx, { state }) => {
-      await state.update({ name: ctx.body });
-    },
-  )
-  .addAnswer("What is your age?", { capture: true }, async (ctx, { state }) => {
-    await state.update({ age: ctx.body });
-  })
-  .addAction(async (_, { flowDynamic, state }) => {
-    await flowDynamic(
-      `${state.get("name")}, thanks for your information!: Your age: ${state.get("age")}`,
-    );
-  });
+// ============================================================
+// Flow de confirmación: responde a "SI" / "NO" del jugador
+// cuando el bot le envió la propuesta de partido.
+// Conecta la respuesta de WhatsApp con el estado asincrónico del partido.
+// ============================================================
+const confirmacionPartidoFlow = addKeyword<Provider, Database>(["SI", "NO", "si", "no"])
+  .addAction(async (ctx, { flowDynamic }) => {
+    const respuesta = ctx.body.toUpperCase().trim() as "SI" | "NO";
+    if (respuesta !== "SI" && respuesta !== "NO") return;
 
-const fullSamplesFlow = addKeyword<Provider, Database>([
-  "samples",
-  utils.setEvent("SAMPLES"),
-])
-  .addAnswer(`💪 I'll send you a lot files...`)
-  .addAnswer(`Send image from Local`, {
-    media: join(process.cwd(), "assets", "sample.png"),
-  })
-  .addAnswer(`Send video from URL`, {
-    media:
-      "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExYTJ0ZGdjd2syeXAwMjQ4aWdkcW04OWlqcXI3Ynh1ODkwZ25zZWZ1dCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/LCohAb657pSdHv0Q5h/giphy.mp4",
-  })
-  .addAnswer(`Send audio from URL`, {
-    media: "https://cdn.freesound.org/previews/728/728142_11861866-lq.mp3",
-  })
-  .addAnswer(`Send file from URL`, {
-    media:
-      "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+    // MOCK: procesarRespuestaJugador es síncrono en el mock
+    // En producción: esta función sería async y llamaría a la BD
+    const resultado = procesarRespuestaJugador(ctx.from, respuesta);
+    await flowDynamic(resultado.mensaje);
   });
 
 const main = async () => {
-  const adapterFlow = createFlow([welcomeFlow, registerFlow, fullSamplesFlow]);
+  const adapterFlow = createFlow([welcomeFlow, confirmacionPartidoFlow]);
   const adapterProvider = createProvider(Provider, {
     jwtToken:
-      "EAAoGL1t0dtwBQkq5g3oomJaNvXb1IxgNldI2Pp5t5PzZCTrwQeYYX2zrCT25csT2Oa6cTK1nNPAv9f2VNALh1QeskH0RIgTuB8d6MbjVIomH9uIztE7bgOkbziHJ5CPp4ZBum5BcyiZCrrqvITSZBFTF5ZA4SwJflQ9thwPZCGtLwdWShWUFIJJSLhW4GdSEiWnwGaybMnpBQenLCmEh4tGYCcppmkftzBfnxkfpcoKD7RlFdagagABhaztxoPEsjpggCqfvAFKGJZA7gN5qupoOTTp",
+      "EAAoGL1t0dtwBQvUQnLW2puVVhgbHb9W8YZCqyJHtBiBjO9KTKCZCt2Uq56HKIgZB95jkIfM26ZAYMaovxLzSzRROZC3C7rZCzWr2KXjHRfEp0BWZBoAXy6nwbTBteY1DRm3vozgJstOyVueG9wZClFItSiuuZCePObZCwjkZBD8hopZAxnMQbBTn0EO7knZASMxDi3ro1eD5eRLCJU1vEoPRwZCIc1jSISroZBCtqVANAm7vWAR3e1xIL9vvZBTNSsq5mdVHuhlboTxZCIa9XCiZAetmoWc04v64KaZAgZDZD",
     numberId: "1015643358289570",
     verifyToken: "perro",
     version: "v22.0",
@@ -117,29 +83,64 @@ const main = async () => {
     database: adapterDB,
   });
 
-  // Configurar mensaje automático cada 5 minutos
-  // cron.schedule(
-  //   "*/5 * * * *", // Ejecutar cada 5 minutos
-  //   async () => {
-  //     const targetNumber = "543512002606";
-  //     const message = "hola queres jugar un partido hoy?";
+  // ============================================================
+  // CRON 1: Trigger diario — crea partidos para el día siguiente
+  // Se ejecuta todos los días a las 20:00 (hora Argentina)
+  //
+  // En cada ejecución:
+  // 1. Cancela partidos expirados (waiting > 48hs)
+  // 2. Agrupa jugadores disponibles por nivel (tolerancia ±1.0 / ±1.5)
+  // 3. Asigna cancha y horario a cada grupo
+  // 4. Crea los Match en estado "notified"
+  // 5. Envía el primer mensaje WhatsApp a los 4 jugadores
+  //
+  // Para testear manualmente: ejecutarTriggerDiario("2025-02-13")
+  // ============================================================
+  cron.schedule(
+    "0 20 * * *",
+    () => {
+      try {
+        const result = ejecutarTriggerDiario();
+        console.log(
+          `[CRON DIARIO] Partidos creados: ${result.partidosCreados} | Jugadores agrupados: ${result.jugadoresAgrupados}`,
+        );
+      } catch (error) {
+        console.error("[CRON DIARIO] Error en trigger diario:", error);
+      }
+    },
+    { timezone: "America/Argentina/Buenos_Aires" },
+  );
 
-  //     try {
-  //       await adapterProvider.sendMessage(targetNumber, message, {});
-  //       console.log(
-  //         `[${new Date().toLocaleString()}] Mensaje automático enviado a ${targetNumber}`,
-  //       );
-  //     } catch (error) {
-  //       console.error(
-  //         `[${new Date().toLocaleString()}] Error enviando mensaje automático:`,
-  //         error,
-  //       );
-  //     }
-  //   },
-  //   {
-  //     timezone: "America/Argentina/Buenos_Aires", // Zona horaria de Argentina
-  //   },
-  // );
+  // ============================================================
+  // CRON 2: Chequeador de confirmaciones — cada 5 minutos
+  // Detecta y procesa jugadores que no confirmaron en tiempo.
+  //
+  // En cada ejecución:
+  // 1. Revisa partidos en estado "notified"
+  // 2. Por cada PlayerNotification vencida (tiempoLimite < ahora):
+  //    → Registra TIMEOUT
+  //    → Inicia búsqueda de reemplazo
+  // 3. Si todos confirmaron → marca partido como "confirmed"
+  // 4. Si no hay reemplazos posibles → cancela el partido
+  //
+  // Para testear manualmente: ejecutarCheckConfirmaciones()
+  // ============================================================
+  cron.schedule(
+    "*/5 * * * *",
+    () => {
+      try {
+        const result = ejecutarCheckConfirmaciones();
+        if (result.partidosRevisados > 0) {
+          console.log(
+            `[CRON CHECK] Revisados: ${result.partidosRevisados} | Confirmados: ${result.partidosConfirmados} | Cancelados: ${result.partidosCancelados} | Timeouts: ${result.timeoutsDetectados}`,
+          );
+        }
+      } catch (error) {
+        console.error("[CRON CHECK] Error en chequeador de confirmaciones:", error);
+      }
+    },
+    { timezone: "America/Argentina/Buenos_Aires" },
+  );
 
   adapterProvider.server.post(
     "/v1/messages",
